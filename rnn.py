@@ -1,4 +1,4 @@
-## NLP part 4: train a cnn model
+## NLP part 3: train a rnn model
 
 # load libraries
 import os
@@ -14,6 +14,7 @@ from keras.layers.normalization import BatchNormalization
 from keras.models import Sequential
 from keras.layers import Dense, Dropout, Flatten
 from keras.layers import Embedding, Convolution1D, MaxPooling1D
+from keras.layers import SimpleRNN, LSTM, GRU
 from keras.preprocessing import sequence
 import keras.callbacks as kcb
 
@@ -23,7 +24,7 @@ ul_train = pd.read_csv('unlabeledTrainData.tsv', sep='\t', header=0, quoting=3)
 train = pd.read_csv('labeledTrainData.tsv', sep='\t')
 test = pd.read_csv('testData.tsv', sep='\t')
 
-## Preparing
+##
 # Text cleaning helper function
 def clean_text(raw, remove_stopwords=False):
 	# remove HTML markup
@@ -44,7 +45,7 @@ t0 = time()
 train['review'] = train['review'].apply(clean_text)
 ul_train['review'] = ul_train['review'].apply(clean_text)
 test['review'] = test['review'].apply(clean_text)
-print "Elapsed time %.2f for cleaning\n" % (time()-t0)  # about 1 minute
+print "Elapsed time %.2f seconds for cleaning.\n" % (time()-t0)  # about 1 minute
 
 vocab_size = 10000
 word_freq = nltk.FreqDist(itertools.chain(
@@ -54,9 +55,10 @@ idx_to_word = [w[0] for w in vocab_freq] + ['UNK']
 word_to_idx = {w: i for i, w in enumerate(idx_to_word)}
 
 print "Tokenizing the review texts..."
+t0 = time()
 train['review'] = train['review'].apply(
 	lambda x: np.array([word_to_idx[w] if w in idx_to_word else vocab_size-1 for w in x]))
-print "Elapsed time %.2f for tokenizing\n" % (time()-t0)
+print "Elapsed time %.2f seconds for tokenizing.\n" % (time()-t0)
 
 
 ## Training
@@ -88,35 +90,56 @@ class CallMetric(kcb.Callback):
             print("\nThe BEST val_acc to date.")
 
 metricRecords = CallMetric()
-checkpointer = kcb.ModelCheckpoint(filepath="imdb_cnn.h5", monitor='val_acc', save_best_only=True, verbose=1)
+checkpointer = kcb.ModelCheckpoint(filepath="imdb_lstm.h5", monitor='val_acc', save_best_only=True, verbose=1)
 
-
-model = Sequential([
+lstm = Sequential([
     Embedding(vocab_size, 32, input_length=seq_len, dropout=0.2),
-    Flatten(),
-    Dense(100, activation='relu'),
-    Dropout(0.7),
+    #BatchNormalization(),
+    LSTM(128),
     Dense(1, activation='sigmoid')])
-model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
-model.fit(train_x, train_y, validation_data=(val_x, val_y), nb_epoch=3, batch_size=64)
+lstm.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
+lstm.fit(train_x, train_y,
+	validation_data=(val_x, val_y), nb_epoch=3, batch_size=64,
+	callbacks=[metricRecords, checkpointer])
 
-
-conv = Sequential([
-    Embedding(vocab_size, 32, input_length=seq_len, dropout=0.2),
-    Dropout(0.2),
-    Convolution1D(64, 5, border_mode='same', activation='relu'),
-    Dropout(0.2),
-    MaxPooling1D(),
-    Flatten(),
-    Dense(100, activation='relu'),
-    Dropout(0.7),
-    Dense(1, activation='sigmoid')])
-conv.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
-conv.fit(train_x, train_y, validation_data=(val_x, val_y),
-    nb_epoch=3, batch_size=64, callbacks=[metricRecords, checkpointer])
-
-pred = conv.predict(val_x, batch_size=128)
+pred = lstm.predict(val_x, batch_size=128)
 
 from sklearn.metrics import roc_auc_score
 print 'AUC score:', roc_auc_score(val_y, pred)
 
+
+########
+def build_rnn(embedding_dim):
+    inp = Input(shape=(1,), dtype='int32', name='model_input')
+    emb = Embedding(vocab_size, embedding_dim, input_length=seq_len, dropout=0.2)(inp)
+    x = SimpleRNN(64, activation='relu', inner_init='identity', return_sequences=True)(x)
+    x = Dropout(0.5)(x)
+    x = SimpleRNN(64, activation='relu', inner_init='identity')(x)
+    x = Dropout(0.5)(x)
+    x = Dense(1, activation='sigmoid')(x)
+    net = Model(inp, x)
+    net.compile(Adam(), loss='binary_crossentropy', metrics=['accuracy'])
+    return net
+
+rnn = build_rnn(64)
+metricRecords = CallMetric()
+checkpointer = kcb.ModelCheckpoint(filepath=model_path+"imdb_rnn.h5", monitor='val_acc',
+                                   save_best_only=True, verbose=1)
+
+
+def build_gru(embedding_dim):
+    inp = Input(shape=(1,), dtype='int32', name='model_input')
+    emb = Embedding(vocab_size, embedding_dim, input_length=seq_len, dropout=0.2)(inp)
+    x = GRU(128, consume_less='gpu', dropout_U=0.2, dropout_W=0.2, return_sequences=True)(x)
+    x = Dropout(0.2)(x)
+    x = GRU(128, consume_less='gpu', dropout_U=0.2, dropout_W=0.2)(x)
+    x = Dropout(0.2)(x)
+    x = Dense(1, activation='sigmoid')(x)
+    net = Model(inp, x)
+    net.compile(Adam(), loss='binary_crossentropy', metrics=['accuracy'])
+    return net
+
+gru1 = build_gru(128)
+metricRecords = CallMetric()
+checkpointer = kcb.ModelCheckpoint(filepath=model_path+"imdb_gru.h5", monitor='val_acc',
+                                   save_best_only=True, verbose=1)
