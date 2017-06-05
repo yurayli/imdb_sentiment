@@ -132,14 +132,14 @@ def build_gru(embedding_dim):
     emb = Embedding(vocab_size, embedding_dim, input_length=seq_len, dropout=0.2)(inp)
     x = GRU(128, consume_less='gpu', dropout_U=0.2, dropout_W=0.2, return_sequences=True)(x)
     x = Dropout(0.2)(x)
-    x = GRU(128, consume_less='gpu', dropout_U=0.2, dropout_W=0.2)(x)
-    x = Dropout(0.2)(x)
+    #x = GRU(128, consume_less='gpu', dropout_U=0.2, dropout_W=0.2)(x)
+    #x = Dropout(0.2)(x)
     x = Dense(1, activation='sigmoid')(x)
     net = Model(inp, x)
     net.compile(Adam(), loss='binary_crossentropy', metrics=['accuracy'])
     return net
 
-gru1 = build_gru(128)
+gru = build_gru(128)
 metricRecords = CallMetric()
 checkpointer = kcb.ModelCheckpoint(filepath=model_path+"imdb_gru.h5", monitor='val_acc',
                                    save_best_only=True, verbose=1)
