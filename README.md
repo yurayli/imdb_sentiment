@@ -1,11 +1,14 @@
 ## Sentiment analysis from IMDB movie review
 
-Competition page
-https://www.kaggle.com/c/word2vec-nlp-tutorial
+Data can be downloaded from
+https://www.kaggle.com/c/word2vec-nlp-tutorial/data
 
 ---
 try several models:
-1. bag of words
-2. word2vec
-3. convolutional net
-4. recurrent net
+1. bag-of-words/tf-idf + linear model
+2. word2vec + linear model
+3. convolutional network
+4. recurrent network
+5. nbsvm
+
+The ensembled model can achieve to auc score 0.9766 (cnn models + nbsvm).
