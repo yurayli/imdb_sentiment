@@ -11,4 +11,4 @@ try several models:
 4. recurrent network
 5. nbsvm
 
-The ensembled model can achieve to auc score 0.9766 (cnn models + nbsvm).
+The ensembled model can achieve auc score of 0.9766 (cnn models + nbsvm).
