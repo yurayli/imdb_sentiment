@@ -1,122 +1,135 @@
-## NLP part 4: train a cnn model
+## imdb movie reviews: train a sentiment classifier using convolutional network
 
 # load libraries
 import os
 import re
 import itertools
-import numpy as np
-import pandas as pd
-import nltk
-from nltk.corpus import stopwords
 from bs4 import BeautifulSoup
 from time import time
-from keras.layers.normalization import BatchNormalization
-from keras.models import Sequential
-from keras.layers import Dense, Dropout, Flatten
-from keras.layers import Embedding, Convolution1D, MaxPooling1D
-from keras.preprocessing import sequence
-import keras.callbacks as kcb
 
+import numpy as np
+import pandas as pd
+from nltk.corpus import stopwords
 
-# import data
-ul_train = pd.read_csv('unlabeledTrainData.tsv', sep='\t', header=0, quoting=3)
-train = pd.read_csv('labeledTrainData.tsv', sep='\t')
-test = pd.read_csv('testData.tsv', sep='\t')
-
-## Preparing
-# Text cleaning helper function
-def clean_text(raw, remove_stopwords=False):
-	# remove HTML markup
-	text = BeautifulSoup(raw, 'lxml').get_text()
-	# remove punctuation and simplify numbers
-	cleanedText = re.sub(r'[\d]+', 'num', re.sub(r'[^\w\s]+', '', text))
-	# change words to lowercase and split them
-	words = cleanedText.lower().split()
-	# remove stopwords
-	if remove_stopwords:
-		stops = set(stopwords.words('english'))
-		words = [w for w in words if not w in stops]
-	return words
-
-# Tokenize the review sentences as input
-print "Cleaning the review texts..."
-t0 = time()
-train['review'] = train['review'].apply(clean_text)
-ul_train['review'] = ul_train['review'].apply(clean_text)
-test['review'] = test['review'].apply(clean_text)
-print "Elapsed time %.2f for cleaning\n" % (time()-t0)  # about 1 minute
-
-vocab_size = 10000
-word_freq = nltk.FreqDist(itertools.chain(
-	*pd.concat([train['review'], ul_train['review'], test['review']], ignore_index=True) ))
-vocab_freq = word_freq.most_common(vocab_size-1)
-idx_to_word = [w[0] for w in vocab_freq] + ['UNK']
-word_to_idx = {w: i for i, w in enumerate(idx_to_word)}
-
-print "Tokenizing the review texts..."
-train['review'] = train['review'].apply(
-	lambda x: np.array([word_to_idx[w] if w in idx_to_word else vocab_size-1 for w in x]))
-print "Elapsed time %.2f for tokenizing\n" % (time()-t0)
-
-
-## Training
-from sklearn.model_selection import train_test_split
-train_x, val_x, train_y, val_y = train_test_split(
-	train['review'], train['sentiment'], test_size=0.1, random_state=0)
-test['review'] = test['review'].apply(
-	lambda x: np.array([word_to_idx[w] if w in idx_to_word else vocab_size-1 for w in x]))
-
-seq_len = 500
-train_x = sequence.pad_sequences(train_x, maxlen=seq_len, value=0)
-val_x = sequence.pad_sequences(val_x, maxlen=seq_len, value=0)
-
-# callback function during training
-class CallMetric(kcb.Callback):
-    def on_train_begin(self, logs={}):
-        self.best_acc = 0.0
-        self.accs = []
-        self.val_accs = []
-        self.losses = []
-        self.val_losses = []
-    def on_epoch_end(self, batch, logs={}):
-        self.accs.append(logs.get('acc'))
-        self.val_accs.append(logs.get('val_acc'))
-        self.losses.append(logs.get('loss'))
-        self.val_losses.append(logs.get('val_loss'))
-        if logs.get('val_acc') > self.best_acc:
-            self.best_acc = logs.get('val_acc')
-            print("\nThe BEST val_acc to date.")
-
-metricRecords = CallMetric()
-checkpointer = kcb.ModelCheckpoint(filepath="imdb_cnn.h5", monitor='val_acc', save_best_only=True, verbose=1)
-
-
-model = Sequential([
-    Embedding(vocab_size, 32, input_length=seq_len, dropout=0.2),
-    Flatten(),
-    Dense(100, activation='relu'),
-    Dropout(0.7),
-    Dense(1, activation='sigmoid')])
-model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
-model.fit(train_x, train_y, validation_data=(val_x, val_y), nb_epoch=3, batch_size=64)
-
-
-conv = Sequential([
-    Embedding(vocab_size, 32, input_length=seq_len, dropout=0.2),
-    Dropout(0.2),
-    Convolution1D(64, 5, border_mode='same', activation='relu'),
-    Dropout(0.2),
-    MaxPooling1D(),
-    Flatten(),
-    Dense(100, activation='relu'),
-    Dropout(0.7),
-    Dense(1, activation='sigmoid')])
-conv.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
-conv.fit(train_x, train_y, validation_data=(val_x, val_y),
-    nb_epoch=3, batch_size=64, callbacks=[metricRecords, checkpointer])
-
-pred = conv.predict(val_x, batch_size=128)
-
+from sklearn.model_selection import KFold
 from sklearn.metrics import roc_auc_score
-print 'AUC score:', roc_auc_score(val_y, pred)
+
+from keras.layers.normalization import BatchNormalization
+from keras.models import Sequential, Model
+from keras.layers import Input, Dense, Dropout, Flatten, merge
+from keras.layers import Embedding, Convolution1D, MaxPooling1D, GlobalMaxPooling1D
+from keras.preprocessing import sequence
+from keras.preprocessing.text import Tokenizer
+
+
+path = "/input/"
+output_path = "/output/"
+
+
+def load_data(path):
+    print "Loading data...\n"
+    # import data
+    #ul_train = pd.read_csv('unlabeledTrainData.tsv', sep='\t', header=0, quoting=3)
+    train = pd.read_csv(path + 'labeledTrainData.tsv', sep='\t')
+    test = pd.read_csv(path + 'testData.tsv', sep='\t')
+    return train, test
+
+
+def tokenize(train, test, vocab_size):
+    # Clean and tokenize the review sentences as input
+    print "Cleaning and tokenizing the review texts..."
+    tokenizer = Tokenizer(nb_words=vocab_size)
+    tokenizer.fit_on_texts(train['review'])
+    train_tokens = tokenizer.texts_to_sequences(train['review'])
+    test_tokens = tokenizer.texts_to_sequences(test['review'])
+    return train_tokens, test_tokens
+
+
+def build_conv_1(vocab_size, seq_len):  # 3 epochs
+    conv = Sequential()
+    conv.add(Embedding(vocab_size, 64, input_length=seq_len, dropout=0.2))
+    conv.add(Dropout(0.2))
+    conv.add(Convolution1D(128, 5, border_mode='same', activation='relu'))
+    conv.add(GlobalMaxPooling1D())
+    conv.add(Dense(128, activation='relu'))
+    conv.add(Dropout(0.75))
+    conv.add(Dense(1, activation='sigmoid'))
+    conv.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
+    return conv
+
+
+def build_conv_2(vocab_size, seq_len):  # 2 epochs
+    conv = Sequential()
+    conv.add(Embedding(vocab_size, 64, input_length=seq_len, dropout=0.2))
+    conv.add(Dropout(0.2))
+    conv.add(Convolution1D(48, 5, border_mode='same', activation='relu'))
+    conv.add(MaxPooling1D(pool_length=4))
+    conv.add(Flatten())
+    conv.add(Dense(128, activation='relu'))
+    conv.add(Dropout(0.75))
+    conv.add(Dense(1, activation='sigmoid'))
+    conv.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
+    return conv
+
+
+def build_conv_mix(vocab_size, seq_len):
+    inp = Input(shape=(seq_len,), dtype='int32', name='model_input')
+    emb = Embedding(vocab_size, 64, input_length=seq_len, dropout=0.2)(inp)
+    x = Dropout(0.2)(emb)
+
+    branch3 = Convolution1D(32, 3, border_mode='same', activation='relu')(x)
+    branch5 = Convolution1D(64, 5, border_mode='same', activation='relu')(x)
+    branch7 = Convolution1D(24, 7, border_mode='same', activation='relu')(x)
+    x = merge([branch3, branch5, branch7], mode='concat', concat_axis=2)
+
+    #x = GlobalMaxPooling1D()(x)  # 3 epochs
+    x = MaxPooling1D(pool_length=4)(x)  # 2 epochs
+    x = Flatten()(x)
+
+    x = Dense(128, activation='relu')(x)
+    x = Dropout(0.75)(x)
+    x = Dense(1, activation='sigmoid')(x)
+    conv = Model(inp, x)
+    conv.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
+    return conv
+
+
+def build_model(vocab_size, seq_len):
+    return build_conv_1(vocab_size, seq_len)
+
+
+def train_cnn(train_tokens, train_targets, test_tokens, vocab_size, seq_len=500, nb_folds=5):
+    train_tensor = sequence.pad_sequences(train_tokens, maxlen=seq_len, value=0)
+    test_x = sequence.pad_sequences(test_tokens, maxlen=seq_len, value=0)
+    kf = KFold(n_splits=nb_folds, shuffle=True, random_state=0)
+    cv_indices = [(tr_id, val_id) for tr_id, val_id in kf.split(train_tensor)]
+    preds_val = []
+    preds_test = []
+    for i in range(nb_folds):
+        print "Training fold %d..." %(i+1)
+        train_x, val_x = train_tensor[cv_indices[i][0]], train_tensor[cv_indices[i][1]]
+        train_y, val_y = train_targets[cv_indices[i][0]], train_targets[cv_indices[i][1]]
+        conv = build_model(vocab_size, seq_len)
+        conv.fit(train_x, train_y, validation_data=(val_x, val_y), nb_epoch=3, batch_size=64)
+        preds_val.append(conv.predict(val_x).ravel())
+        preds_test.append(conv.predict(test_x).ravel())
+        conv.save_weights(output_path + 'model_%d.h5' %(i+1))
+    print "CV score: %.4f" \
+        %(np.mean([roc_auc_score(train_targets[cv_indices[i][1]], preds_val[i]) for i in range(nb_folds)]))
+    return np.mean(preds_test, 0)
+
+
+def run(vocab_size=50000):
+    train, test = load_data(path)
+    train_tokens, test_tokens = tokenize(train, test, vocab_size)
+    test_id = test['id']
+    train_targets = train['sentiment'].values
+    del train, test
+    pred = train_cnn(train_tokens, train_targets, test_tokens, vocab_size)
+    submit = pd.DataFrame({'id': test_id, 'sentiment': pred})
+    submit.to_csv(output_path + 'imdb_cnn.csv', index=False)
+
+
+if __name__ == "__main__":
+    run()
 
