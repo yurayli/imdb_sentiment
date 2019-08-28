@@ -3,9 +3,9 @@ import itertools, argparse, pickle, random
 
 import numpy as np
 import pandas as pd
-import nltk
 from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.metrics import accuracy_score, roc_auc_score
+from sklearn.utils import shuffle
 
 import matplotlib
 matplotlib.use('Agg')
@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import LambdaLR, StepLR, MultiStepLR, ReduceLROnPlateau
-from torch.utils.data import Dataset, DataLoader, sampler
+from torch.utils.data import Dataset, DataLoader, Sampler
 
 USE_GPU = True
 dtype = torch.float32
@@ -28,9 +28,11 @@ else:
 SEED = 2019
 path = '../input/word2vec-nlp-tutorial/'
 output_path = './'
-EMBEDDING_FILE_GV = '../input/quora-insincere-questions-classification/embeddings/glove.840B.300d/glove.840B.300d.txt'
-EMBEDDING_FILE_PR = '../input/quora-insincere-questions-classification/embeddings/paragram_300_sl999/paragram_300_sl999.txt'
-EMBEDDING_FILE_FT = '../input/quora-insincere-questions-classification/embeddings/wiki-news-300d-1M/wiki-news-300d-1M.vec'
+EMBEDDING_FILES = [
+    '../input/pickled-glove840b300d-for-10sec-loading/glove.840B.300d.pkl',
+    '../input/pickled-paragram-300-vectors-sl999/paragram_300_sl999.pkl',
+    '../input/pickled-crawl300d2m-for-kernel-competitions/crawl-300d-2M.pkl'
+]
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--maxlen', type=int, default=500,
@@ -38,11 +40,11 @@ parser.add_argument('--maxlen', type=int, default=500,
 parser.add_argument('--vocab-size', type=int, default=50000)
 parser.add_argument('--n-splits', type=int, default=10,
                     help='splits of n-fold cross validation')
-parser.add_argument('--batch-size', type=int, default=32,
-                    help='batch size during training')
+parser.add_argument('--nb-models', type=int, default=2,
+                    help='number of models (folds) to ensemble')
+parser.add_argument('--batch-size', type=int, default=32)
 parser.add_argument('--lr', type=float, default=0.003)
-parser.add_argument('--epochs', type=int, default=4,
-                    help='number of training epochs')
+parser.add_argument('--epochs', type=int, default=4)
 args = parser.parse_args()
 
 label_cols = 'sentiment'
@@ -58,34 +60,48 @@ def clean_punc(x):
         x = x.replace(punct, f' {punct} ')
     return x
 
-def clean_numbers(x):
-    x = re.sub('[0-9]{5,}', '#####', x)
-    x = re.sub('[0-9]{4}', '####', x)
-    x = re.sub('[0-9]{3}', '###', x)
-    x = re.sub('[0-9]{2}', '##', x)
-    return x
-
 def clean_text(raw):
-    return clean_numbers(clean_punc(raw.lower()))
+    return clean_punc(raw.lower()).strip()
 
 
-def word_idx_map(raw_comments, vocab_size):
-    texts = []
-    for c in raw_comments:
-        texts.append(c.split())
-    word_freq = nltk.FreqDist(itertools.chain(*texts))
-    vocab_freq = word_freq.most_common(vocab_size-2)
+def word_idx_map(raw_texts, vocab_size):
+    def build_vocab(sentences):
+        """
+        :param sentences: list of list of words
+        :return: dictionary of words and their count
+        """
+        vocab = {}
+        for sentence in sentences:
+            for word in sentence:
+                try:
+                    vocab[word] += 1
+                except KeyError:
+                    vocab[word] = 1
+        return vocab
+
+    def most_common_vocab(vocab, k):
+        """
+        :param vocab: dictionary of words and their count
+        :k: former k words to return
+        :return: list of k most common words
+        """
+        sorted_vocab = sorted([(cnt,w) for w,cnt in vocab.items()])[::-1]
+        return [(w,cnt) for cnt,w in sorted_vocab][:k]
+
+    texts = [c.split() for c in raw_texts]
+    word_freq = build_vocab(texts)
+    vocab_freq = most_common_vocab(word_freq, vocab_size)
     idx_to_word = ['<pad>'] + [word for word, cnt in vocab_freq] + ['<unk>']
     word_to_idx = {word:idx for idx, word in enumerate(idx_to_word)}
 
     return idx_to_word, word_to_idx
 
 
-def tokenize(comments, word_to_idx, maxlen):
+def tokenize(texts, word_to_idx, maxlen):
     '''
-    Tokenize and numerize the comment sequences
+    Tokenize and numerize the text sequences
     Inputs:
-    - comments: pandas series with wiki comments
+    - texts: raw texts
     - word_to_idx: mapping from word to index
     - maxlen: max length of each sequence of tokens
 
@@ -93,59 +109,207 @@ def tokenize(comments, word_to_idx, maxlen):
     - tokens: array of shape (data_size, maxlen)
     '''
 
-    tokens = []
-    for c in comments.tolist():
-        token = [(lambda x: word_to_idx[x] if x in word_to_idx else word_to_idx['<unk>'])(w) \
-                 for w in c.split()]
-        if len(token) > maxlen:
-            token = token[-maxlen:]
-        else:
-            token = [0] * (maxlen-len(token)) + token
-        tokens.append(token)
-    return np.array(tokens).astype('int32')
+    def text_to_id(c, word_to_idx, maxlen):
+        return [(lambda x: word_to_idx[x] if x in word_to_idx else word_to_idx['<unk>'])(w) \
+                 for w in c.split()[-maxlen:]]
+
+    return [text_to_id(c, word_to_idx, maxlen) for c in texts]
+
+
+# Seed for randomness in pytorch
+def seed_torch(seed=SEED):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
 
 
 # Load pre-trained word vector
-def get_coefs(word, *arr): return word, np.asarray(arr, dtype='float32')
+def load_embeddings(path):
+    with open(path,'rb') as f:
+        emb_index = pickle.load(f)
+    return emb_index
 
-def get_embedding(embedding_file, embedding_dim, word_to_idx, vocab_size):
-    with open(embedding_file, encoding="utf8", errors='ignore') as f:
-        embeddings_index = dict(get_coefs(*o.split(' ')) for o in f if len(o)>100)
-    all_embs = np.stack(embeddings_index.values())
+def get_embedding(embedding_file, word_to_idx, embedding_dim=300):
+    print(f'loading {embedding_file}')
+    embeddings_index = load_embeddings(embedding_file)
+
+    all_embs = np.stack([emb for emb in embeddings_index.values() if len(emb)==embedding_dim])
     emb_mean, emb_std = all_embs.mean(), all_embs.std()
-    nb_words = min(vocab_size, len(word_to_idx))
+
+    nb_words = len(word_to_idx)
     embedding_matrix = np.random.normal(emb_mean, emb_std, (nb_words, embedding_dim))
     for word, i in word_to_idx.items():
-        if i >= vocab_size: continue
+        if i > nb_words: break
         embedding_vector = embeddings_index.get(word)
-        if embedding_vector is not None: embedding_matrix[i] = embedding_vector
+        if embedding_vector is not None:
+            embedding_matrix[i] = embedding_vector
+            continue
+        embedding_vector = embeddings_index.get(word.upper())
+        if embedding_vector is not None:
+            embedding_matrix[i] = embedding_vector
+            continue
+        embedding_vector = embeddings_index.get(word.title())
+        if embedding_vector is not None:
+            embedding_matrix[i] = embedding_vector
+            continue
     return embedding_matrix
 
 
 class IMDB_dataset(Dataset):
 
-    def __init__(self, tokenized_reviews, targets=None):
+    def __init__(self, tokenized_reviews, targets=None, split=None, maxlen=256):
         self.reviews = tokenized_reviews
         self.targets = targets if targets is None else targets[:,None]
+        self.split = split
+        assert self.split in {'train', 'valid', 'test'}
+        self.maxlen = maxlen
 
     def __getitem__(self, index):
         review = self.reviews[index]
         if self.targets is not None:
             target = self.targets[index]
-            return torch.LongTensor(review), torch.FloatTensor(target)
+            return review, torch.FloatTensor(target)
         else:
-            return torch.LongTensor(review)
+            return review
 
     def __len__(self):
         return len(self.reviews)
 
+    def get_lens(self):
+        lengths = np.fromiter(
+            ((min(self.maxlen, len(seq))) for seq in self.reviews),
+            dtype=np.int32)
+        return lengths
 
-def prepare_loader(x, y=None, batch_size=256, train=True):
-    data_set = IMDB_dataset(x, y)
-    if train:
-        return DataLoader(data_set, batch_size=batch_size, shuffle=True)
+    def collate_fn(self, batch):
+        """
+        Collate function for sequence bucketing
+        Note: this need not be defined in this Class, can be standalone.
+
+        :param batch: an iterable of N sets from __getitem__()
+        :return: a tensor of reviews, and targets
+        """
+
+        if self.split in ('train', 'valid'):
+            reviews, targets = zip(*batch)
+        else:
+            reviews = batch
+
+        lengths = [len(c) for c in reviews]
+        maxlen = max(lengths)
+        padded_reviews = []
+        for i, c in enumerate(reviews):
+            padded_reviews.append([0]*(maxlen - lengths[i])+c)
+
+        if self.split in ('train', 'valid'):
+            return torch.LongTensor(padded_reviews), torch.stack(targets)
+        else:
+            return torch.LongTensor(padded_reviews)
+
+
+class BucketSampler(Sampler):
+
+    def __init__(self, data_source, sort_lens, bucket_size=None, batch_size=1024, shuffle_data=True):
+        super().__init__(data_source)
+        self.shuffle = shuffle_data
+        self.batch_size = batch_size
+        self.sort_lens = sort_lens
+        self.bucket_size = bucket_size if bucket_size is not None else len(sort_lens)
+        self.weights = None
+
+        if not shuffle_data:
+            self.index = self.prepare_buckets()
+        else:
+            self.index = None
+
+    def set_weights(self, weights):
+        assert weights >= 0
+        total = np.sum(weights)
+        if total != 1:
+            weights = weights / total
+        self.weights = weights
+
+    def __iter__(self):
+        indices = None
+        if self.weights is not None:
+            total = len(self.sort_lens)
+            indices = np.random.choice(total, (total,), p=self.weights)
+        if self.shuffle:
+            self.index = self.prepare_buckets(indices)
+        return iter(self.index)
+
+    def get_reverse_indexes(self):
+        indexes = np.zeros((len(self.index),), dtype=np.int32)
+        for i, j in enumerate(self.index):
+            indexes[j] = i
+        return indexes
+
+    def __len__(self):
+        return len(self.sort_lens)
+
+    def prepare_buckets(self, indices=None):
+        lengths = - self.sort_lens
+        assert self.bucket_size % self.batch_size == 0 or self.bucket_size == len(lengths)
+
+        if indices is None:
+            if self.shuffle:
+                indices = shuffle(np.arange(len(lengths), dtype=np.int32))
+                lengths = lengths[indices]
+            else:
+                indices = np.arange(len(lengths), dtype=np.int32)
+
+        #  bucket iterator
+        def divide_chunks(l, n):
+            if n == len(l):
+                yield np.arange(len(l), dtype=np.int32), l
+            else:
+                # looping till length l
+                for i in range(0, len(l), n):
+                    data = l[i:i + n]
+                    yield np.arange(i, i + len(data), dtype=np.int32), data
+
+        new_indices = []
+        extra_batch_idx = None
+        for chunk_index, chunk in divide_chunks(lengths, self.bucket_size):
+            # sort indices in bucket by descending order of length
+            indices_sorted = chunk_index[np.argsort(chunk)]
+
+            batch_idxes = []
+            for _, batch_idx in divide_chunks(indices_sorted, self.batch_size):
+                if len(batch_idx) == self.batch_size:
+                    batch_idxes.append(batch_idx.tolist())
+                else:
+                    assert extra_batch_idx is None
+                    assert batch_idx is not None
+                    extra_batch_idx = batch_idx.tolist()
+
+            # shuffling batches within buckets
+            if self.shuffle:
+                batch_idxes = shuffle(batch_idxes)
+            for batch_idx in batch_idxes:
+                new_indices.extend(batch_idx)
+
+        if extra_batch_idx is not None:
+            new_indices.extend(extra_batch_idx)
+
+        if not self.shuffle:
+            self.original_indices = np.argsort(indices_sorted).tolist()
+        return indices[new_indices]
+
+
+def prepare_loader(x, y=None, batch_size=256, split=None):
+    assert split in {'train', 'valid', 'test'}
+    dataset = IMDB_dataset(x, y, split, args.maxlen)
+    if split == 'train':
+        sampler = BucketSampler(dataset, dataset.get_lens(),
+                                bucket_size=batch_size*20, batch_size=batch_size)
+        return DataLoader(dataset, batch_size=batch_size, sampler=sampler,
+                          collate_fn=dataset.collate_fn)
     else:
-        return DataLoader(data_set, batch_size=batch_size)
+        sampler = BucketSampler(dataset, dataset.get_lens(),
+                                batch_size=batch_size, shuffle_data=False)
+        return DataLoader(dataset, batch_size=batch_size, sampler=sampler,
+                          collate_fn=dataset.collate_fn), sampler.original_indices
 
 
 # one-cycle scheduler
@@ -209,7 +373,7 @@ class OneCycleScheduler(object):
 # solver of model with validation
 class NetSolver(object):
 
-    def __init__(self, model, optimizer, scheduler=None, checkpoint_name='toxic_comment'):
+    def __init__(self, model, optimizer, scheduler=None, checkpoint_name='imdb'):
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
@@ -322,6 +486,9 @@ class NetSolver(object):
 
             self.log_and_checkpoint(e, train_loss, val_loss, train_auc, val_auc)
 
+            if self.scheduler is not None:
+                self.scheduler.step()
+
 
     def train_one_cycle(self, loaders, epochs):
         train_loader, val_loader = loaders
@@ -357,7 +524,7 @@ class NetSolver(object):
         self.auc_history.append(train_auc)
         self.val_auc_history.append(val_auc)
 
-        # for floydhub metric graphs
+        # metrics log
         print('{"metric": "AUC", "value": %.4f, "epoch": %d}' % (train_auc, e+1))
         print('{"metric": "Val. AUC", "value": %.4f, "epoch": %d}' % (val_auc, e+1))
         print('{"metric": "Acc", "value": %.4f, "epoch": %d}' % (train_acc, e+1))
@@ -408,7 +575,7 @@ class EmbeddingLayer(nn.Module):
         super(EmbeddingLayer, self).__init__()
         self.emb = nn.Embedding(vocab_size, embed_dim)
         self.emb.weight = nn.Parameter(torch.tensor(embed_matrix, dtype=torch.float32))
-        self.dropout_emb = nn.Dropout2d(0.25)
+        self.dropout_emb = nn.Dropout2d(0.4)
 
     def forward(self, seq):
         emb = self.emb(seq)
@@ -423,17 +590,12 @@ class RecurrentNet(nn.Module):
         self.lstm = nn.LSTM(embed_dim, hidden_dim, bidirectional=True, batch_first=True)
         self.gru = nn.GRU(hidden_dim*2, hidden_dim, bidirectional=True, batch_first=True)
 
-        for name, param in self.lstm.named_parameters():
-            if 'weight_ih' in name:
-                nn.init.xavier_uniform_(param)
-            if 'weight_hh' in name:
-                nn.init.orthogonal_(param)
-
-        for name, param in self.gru.named_parameters():
-            if 'weight_ih' in name:
-                nn.init.xavier_uniform_(param)
-            if 'weight_hh' in name:
-                nn.init.orthogonal_(param)
+        for mod in (self.lstm, self.gru):
+            for name, param in mod.named_parameters():
+                if 'weight_ih' in name:
+                    nn.init.xavier_uniform_(param)
+                if 'weight_hh' in name:
+                    nn.init.orthogonal_(param)
 
     def forward(self, seq):
         o_lstm, _ = self.lstm(seq)
@@ -479,18 +641,26 @@ def model_optimizer_init(nb_neurons, vocab_size, embed_mat):
     params_2 = [p for p in model.rnns.parameters()]
     params_3 = [p for p in model.classifier.parameters()]
 
-    for p in params_1: p.requires_grad = True
-    for p in params_2: p.requires_grad = True
-    for p in params_3: p.requires_grad = True
-
     optimizer = torch.optim.Adam(params=[{'params': params_1}])
     optimizer.add_param_group({'params':params_2})
     optimizer.add_param_group({'params':params_3})
 
     return model, optimizer
 
+def eval_model(model, data_loader, mode='test'):
+    assert mode in ('val', 'test')
+    model.eval()
+    test_scores = []
+    with torch.no_grad():
+        for x in data_loader:
+            if mode=='val': x = x[0]
+            x = x.to(device)
+            score = torch.sigmoid(model(x))[:,0]
+            test_scores.append(score.cpu().numpy())
+    return np.concatenate(test_scores)
 
-def load_and_preproc():
+
+def load_preproc_and_tokenize():
     train_df = pd.read_csv(path+'labeledTrainData.tsv', sep='\t')
     test_df = pd.read_csv(path+'testData.tsv', sep='\t')
 
@@ -500,10 +670,6 @@ def load_and_preproc():
     test_df['review'] = test_df['review'].apply(clean_text)
     print('cleaning complete in {:.0f} seconds.'.format(time.time()-t0))
 
-    return train_df, test_df
-
-
-def tokenize_reviews(train_df, test_df):
     y_train = train_df[label_cols].values.astype('uint8')
     full_text = train_df['review'].tolist() + test_df['review'].tolist()
 
@@ -514,33 +680,33 @@ def tokenize_reviews(train_df, test_df):
     x_test = tokenize(test_df['review'], word_to_idx, args.maxlen)
     print('tokenizing complete in {:.0f} seconds.'.format(time.time()-t0))
 
-    return x_train, y_train, x_test, word_to_idx
+    return x_train, y_train, x_test, word_to_idx, test_df['id'].tolist()
 
 
-def train_val_split(train_x, train_y):
-    kf = KFold(n_splits=args.n_splits, shuffle=True, random_state=SEED)
-    cv_indices = [(tr_idx, val_idx) for tr_idx, val_idx in kf.split(train_x)]
+def train_val_split(train_x, train_y, nb_models=args.nb_models):
+    kf = StratifiedKFold(n_splits=args.n_splits, shuffle=True, random_state=SEED)
+    cv_indices = [(tr_idx, val_idx) for tr_idx, val_idx in kf.split(train_x, train_y)]
+    if nb_models:
+        return cv_indices[:nb_models]
     return cv_indices
 
 
 def main(args):
-    # load data
-    train_df, test_df = load_and_preproc()
-    train_seq, train_tars, x_test, word_to_idx = tokenize_reviews(train_df, test_df)
+    # load and tokenize data
+    train_seq, train_tars, x_test, word_to_idx, test_id = load_preproc_and_tokenize()
 
     # load pretrained embedding
     print('loading embeddings...')
     t0 = time.time()
-    embed_mat_1 = get_embedding(EMBEDDING_FILE_GV, 300, word_to_idx, args.vocab_size)
-    embed_mat_2 = get_embedding(EMBEDDING_FILE_PR, 300, word_to_idx, args.vocab_size)
-    #embed_mat_3 = get_embedding(EMBEDDING_FILE_FT, 300, word_to_idx, args.vocab_size)
-    embed_mat = np.mean([embed_mat_1, embed_mat_2], 0)
+    embed_mat = np.mean(
+        [get_embedding(f, word_to_idx) for f in EMBEDDING_FILES], axis=0)
     print('loading complete in {:.0f} seconds.'.format(time.time()-t0))
 
     # training preparation
-    train_preds = np.zeros((len(train_tars),1), dtype='float32') # matrix for the out-of-fold predictions
-    test_preds = np.zeros((len(test_df),1), dtype='float32') # matrix for the predictions on the testset
-    test_loader = prepare_loader(x_test, train=False)
+    val_preds = []      # for the out-of-fold predictions
+    test_preds = []     # for the predictions on the testset
+    oof_tars = []       # for the oof targets
+    test_loader, test_original_indices = prepare_loader(x_test, split='test')
     cv_indices = train_val_split(train_seq, train_tars)
 
     print()
@@ -548,14 +714,15 @@ def main(args):
         print(f'Fold {i + 1}')
 
         # train/val split
-        x_train, x_val = train_seq[trn_idx], train_seq[val_idx]
+        x_train, x_val = [train_seq[i] for i in trn_idx], [train_seq[i] for i in val_idx]
         y_train, y_val = train_tars[trn_idx], train_tars[val_idx]
-        train_loader = prepare_loader(x_train, y_train, args.batch_size)
-        val_loader = prepare_loader(x_val, y_val, train=False)
+        train_loader = prepare_loader(x_train, y_train, args.batch_size, split='train')
+        val_loader, val_original_indices = prepare_loader(x_val, y_val, split='valid')
+        oof_tars.append(y_val)
 
         # model setup
-        ft_lrs = [args.lr/20, args.lr, args.lr]
-        model, optimizer = model_optimizer_init(192, args.vocab_size, embed_mat)
+        ft_lrs = [args.lr*0.08, args.lr, args.lr]
+        model, optimizer = model_optimizer_init(160, args.vocab_size, embed_mat)
         scheduler = OneCycleScheduler(optimizer, args.epochs, train_loader, max_lr=ft_lrs, moms=(.8, .7))
         solver = NetSolver(model, optimizer, scheduler)
 
@@ -566,24 +733,21 @@ def main(args):
         print('time = {:.0f}m {:.0f}s.'.format(time_elapsed // 60, time_elapsed % 60))
 
         # inference
-        solver.model.eval()
-        test_scores = []
-        with torch.no_grad():
-            for x in test_loader:
-                x = x.to(device=device, dtype=torch.long)
-                score = torch.sigmoid(solver.model(x))
-                test_scores.append(score.cpu().numpy())
-        test_scores = np.concatenate(test_scores)
+        test_scores = eval_model(solver.model, test_loader)[test_original_indices]
 
-        train_preds[val_idx] = solver.val_scores
-        test_preds += test_scores / args.n_splits
+        val_preds.append(solver.val_scores[val_original_indices])
+        test_preds.append(test_scores)
 
         print()
 
-    # submit
-    print(f'For whole train set, val auc score is {roc_auc_score(train_tars, train_preds)}')
+    oof_tars = np.concatenate(oof_tars)
+    val_preds = np.concatenate(val_preds)
+    print(f'For whole train set, val auc score is {roc_auc_score(oof_tars, val_preds)}')
+
+    # make submission
+    test_preds = np.mean(test_preds, 0)
     submit = pd.DataFrame(test_preds, columns=[label_cols])
-    submit['id'] = test_df['id'].copy()
+    submit['id'] = test_id
     submit.to_csv('submission.csv', index=False)
 
 
